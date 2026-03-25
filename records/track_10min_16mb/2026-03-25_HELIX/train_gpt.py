@@ -609,78 +609,131 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
-class CausalSelfAttention(nn.Module):
+class DTPA(nn.Module):
+    """
+    Differential Tensor Product Attention.
+    Combines TPA (factored Q/K/V via rank-r outer products) with
+    Differential Attention (noise-canceling A1 - λ*A2).
+
+    Parameters per block at d=768, rank=4, n_heads=8, n_kv=4:
+      W_cQ [768,64] + A_q [16,4,48] + W_cK [768,32] + A_k [8,4,48]
+      W_cV [768,32] + A_v [8,4,48] + W_O [384,768] + λ [8] + q_gain [8]
+      = ~399K params (vs 2,359K for standard GQA at d=768)
+    """
     def __init__(
         self,
         dim: int,
-        num_heads: int,
-        num_kv_heads: int,
+        n_heads: int,
+        n_kv: int,
+        rank: int,
+        rope_dims: int,
         rope_base: float,
-        qk_gain_init: float,
-        gated_attention: bool = False,
-        value_residual: bool = False,
+        use_xsa: bool = False,
+        num_iterations: int = 3,
     ):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        # No CastedLinear -- weights come from banks
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
-        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
-        self.use_xsa = False  # set by GPT.__init__ for deep layers only
-        # Gated attention and value residual (non-banked small params)
-        self.gated_attention = gated_attention
-        if gated_attention:
-            self.attn_gate = nn.Linear(dim, num_heads, bias=True)
-            nn.init.zeros_(self.attn_gate.weight)
-            nn.init.constant_(self.attn_gate.bias, 4.0)
-        self.value_residual = value_residual
-        if value_residual:
-            self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
-    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
-        """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
-        y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
-        B, T, H, D = y.shape
-        Hkv = v.size(-2)
-        group = H // Hkv
-        y_g = y.reshape(B, T, Hkv, group, D)        # [B, T, Hkv, group, D]
-        vn = F.normalize(v, dim=-1).unsqueeze(-2)    # [B, T, Hkv, 1, D] -- broadcast ready
-        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
-        return (y_g - proj).reshape(B, T, H, D)
-    def forward(self, x: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
-        bsz, seqlen, dim = x.shape
-        q = F.linear(x, q_w.to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = F.linear(x, k_w.to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = F.linear(x, v_w.to(x.dtype))
-        if v_embed is not None:
-            v = v + v_embed
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        raw_v = v if self.value_residual else None
-        if self.value_residual and v0 is not None:
-            lam = self.vr_lambda.to(dtype=v.dtype)
-            v = lam[0] * v0 + lam[1] * v
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
-        if self.use_xsa:
-            y = self._xsa_efficient(y, v)
-        if self.gated_attention:
-            # gate shape: (bsz, seqlen, num_heads) -> (bsz, seqlen, num_heads, 1) for B,T,H,D layout
-            gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
-            y = y * gate
-        y = y.reshape(bsz, seqlen, dim)
-        return F.linear(y, out_w.to(x.dtype)), raw_v
+        assert dim % n_heads == 0 and n_heads % n_kv == 0
+        self.dim = dim
+        self.n_heads = n_heads
+        self.n_kv = n_kv
+        self.rank = rank
+        self.rope_dims = rope_dims
+        self.use_xsa = use_xsa
+        self.num_iterations = num_iterations
+        self.d_head = dim // n_heads           # 96
+        self.d_head_half = self.d_head // 2    # 48
+
+        # Context projections (2D → Muon-eligible)
+        self.W_cQ = CastedLinear(dim, 2 * n_heads * rank, bias=False)     # [768, 64]
+        self.W_cK = CastedLinear(dim, 2 * n_kv * rank,   bias=False)     # [768, 32]
+        self.W_cV = CastedLinear(dim, 2 * n_kv * rank,   bias=False)     # [768, 32]
+        self.W_O  = CastedLinear(n_heads * self.d_head_half, dim, bias=False)  # [384, 768]
+
+        # Basis tensors (3D → Adam; auto-passthrough in int6 quant, numel < 65536)
+        self.A_q = nn.Parameter(torch.empty(2 * n_heads, rank, self.d_head_half))  # [16, 4, 48]
+        self.A_k = nn.Parameter(torch.empty(2 * n_kv,   rank, self.d_head_half))  # [8, 4, 48]
+        self.A_v = nn.Parameter(torch.empty(2 * n_kv,   rank, self.d_head_half))  # [8, 4, 48]
+
+        # Differential lambda (1D → scalar Adam via ndim<2 rule)
+        self.lam = nn.Parameter(torch.ones(n_heads))
+
+        # Q-gain (matches "q_gain" control pattern → float32 scalar Adam)
+        self.q_gain = nn.Parameter(torch.ones(n_heads, dtype=torch.float32))
+
+        # RoPE cache (only for rope_dims dims of d_head_half)
+        self.rotary = Rotary(rope_dims, base=rope_base)
+
+        # XSA: additional output projection for last-iteration blocks
+        if use_xsa:
+            self.W_O_xsa = CastedLinear(n_heads * self.d_head_half, dim, bias=False)  # [384, 768]
+
+    def forward(self, h: Tensor, x_residual: Tensor, layer_r: int) -> Tensor:
+        """
+        h           : [B, T, dim]  — pre-norm hidden state
+        x_residual  : [B, T, dim]  — pre-norm residual stream (for XSA V)
+        layer_r     : int          — current MoR iteration index
+        """
+        B, T, _ = h.shape
+
+        # ---- Step 1: Factored Q/K/V reconstruction ----
+        # W_cQ projects h to context codes, then einsum with static basis A_q
+        c_Q = self.W_cQ(h).view(B, T, 2 * self.n_heads, self.rank)   # [B, T, 16, 4]
+        # Broadcast einsum: code[b,t,head,r] × basis[head,r,d] → sum over r
+        Q_all = (c_Q.unsqueeze(-1) * self.A_q).sum(-2)                # [B, T, 16, 48]
+        Q1, Q2 = Q_all.chunk(2, dim=2)                                # each [B, T, 8, 48]
+
+        c_K = self.W_cK(h).view(B, T, 2 * self.n_kv, self.rank)      # [B, T, 8, 4]
+        K_all = (c_K.unsqueeze(-1) * self.A_k).sum(-2)                # [B, T, 8, 48]
+        K1, K2 = K_all.chunk(2, dim=2)                                # each [B, T, 4, 48]
+
+        c_V = self.W_cV(h).view(B, T, 2 * self.n_kv, self.rank)
+        V_all = (c_V.unsqueeze(-1) * self.A_v).sum(-2)                # [B, T, 8, 48]
+        V1, V2 = V_all.chunk(2, dim=2)                                # each [B, T, 4, 48]
+
+        # ---- Step 2: Partial RoPE on reconstructed Q/K ----
+        # Rotary is initialized with rope_dims; apply_rotary_emb handles partial rotation
+        cos, sin = self.rotary(T, h.device, h.dtype)   # [1, T, 1, rope_dims//2]
+        Q1 = apply_rotary_emb(Q1, cos, sin, self.rope_dims)
+        Q2 = apply_rotary_emb(Q2, cos, sin, self.rope_dims)
+        K1 = apply_rotary_emb(K1, cos, sin, self.rope_dims)
+        K2 = apply_rotary_emb(K2, cos, sin, self.rope_dims)
+
+        # ---- Step 3: QK-norm + Q-gain ----
+        Q1 = F.rms_norm(Q1, (Q1.size(-1),))
+        Q2 = F.rms_norm(Q2, (Q2.size(-1),))
+        K1 = F.rms_norm(K1, (K1.size(-1),))
+        K2 = F.rms_norm(K2, (K2.size(-1),))
+        q_g = self.q_gain.to(dtype=Q1.dtype)[None, None, :, None]     # [1, 1, 8, 1]
+        Q1 = Q1 * q_g
+        Q2 = Q2 * q_g
+
+        # ---- Step 4: XSA path (last iteration, XSA blocks only) ----
+        if self.use_xsa and layer_r == self.num_iterations - 1:
+            # XSA: use first d_head_half dims of residual stream as V values
+            # x_residual [B, T, 768] → [B, T, 8, 48] by splitting the first 384 dims
+            x_as_v = x_residual[..., :self.n_heads * self.d_head_half]
+            x_as_v = x_as_v.view(B, T, self.n_heads, self.d_head_half)
+            # Expand K1 [B, T, 4, 48] → [B, T, 8, 48] for full-head attention
+            K1_exp = K1.repeat_interleave(self.n_heads // self.n_kv, dim=2)
+            # flash_attn_3_func takes [B, T, H, D] format
+            out = flash_attn_3_func(Q1, K1_exp, x_as_v, causal=True)  # [B, T, 8, 48]
+            out = out.reshape(B, T, self.n_heads * self.d_head_half)   # [B, T, 384]
+            return self.W_O_xsa(out)                                   # [B, T, 768]
+
+        # ---- Step 5: Differential attention ----
+        # FA3 handles GQA natively (Q:8 heads, K/V:4 heads → output:8 heads)
+        out1 = flash_attn_3_func(Q1, K1, V1, causal=True)             # [B, T, 8, 48]
+        out2 = flash_attn_3_func(Q2, K2, V2, causal=True)             # [B, T, 8, 48]
+        lam  = self.lam.to(dtype=h.dtype)[None, None, :, None]        # [1, 1, 8, 1]
+        out  = out1 - lam * out2                                       # [B, T, 8, 48]
+
+        # ---- Step 6: GroupNorm + output projection ----
+        # Reshape to [B*T, 384] for group_norm (C=384, num_groups=8 → 48 dims/group)
+        out = F.group_norm(
+            out.reshape(B * T, self.n_heads * self.d_head_half),
+            num_groups=self.n_heads,
+        ).reshape(B, T, self.n_heads * self.d_head_half)
+        return self.W_O(out)                                           # [B, T, 768]
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
