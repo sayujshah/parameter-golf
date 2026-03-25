@@ -44,9 +44,9 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 5))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
@@ -56,7 +56,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.023))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -80,7 +80,7 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 2))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
@@ -98,6 +98,16 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    # --- HELIX architecture fields ---
+    dtpa_rank = int(os.environ.get("DTPA_RANK", 4))
+    num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", 5))
+    num_iterations = int(os.environ.get("NUM_ITERATIONS", 3))
+    ffn_hidden = int(os.environ.get("FFN_HIDDEN", 1536))
+    # HELIX overrides: d=768, 8Q/4KV, rope_dims=16, xsa_last_n=2
+    # (override existing SOTA defaults in the same fields)
+    # MoR load-balancing
+    mor_lb_weight = float(os.environ.get("MOR_LB_WEIGHT", 0.01))
+    mor_lb_decay_steps = int(os.environ.get("MOR_LB_DECAY_STEPS", 1000))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -364,7 +374,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda,mor_gate",
     ).split(",")
     if pattern
 )
