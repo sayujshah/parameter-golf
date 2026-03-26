@@ -1439,79 +1439,69 @@ def main() -> None:
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     CastedLinear._qat_enabled = args.qat_enabled
-    base_model = GPT(
+    base_model = HELIX_GPT(
         vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
+        num_unique_blocks=args.num_unique_blocks,
+        num_iterations=args.num_iterations,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
+        dtpa_rank=args.dtpa_rank,
+        ffn_hidden=args.ffn_hidden,
+        rope_dims=args.rope_dims,
+        xsa_last_n=args.xsa_last_n,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=args.mtp_num_heads,
-        mtp_loss_weight=args.mtp_loss_weight,
-        bigram_vocab_size=args.bigram_vocab_size,
-        bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims,
-        ln_scale=args.ln_scale,
-        dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled,
-        ve_dim=args.ve_dim,
-        ve_layers=args.ve_layers,
-        gated_attention=args.gated_attention,
-        value_residual=args.value_residual,
     ).to(device).bfloat16()
-    # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
-    base_model.qo_bank.data = base_model.qo_bank.data.float()
-    base_model.kv_bank.data = base_model.kv_bank.data.float()
-    base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
-    base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    # HELIX: cast CastedLinear params to FP32 (computed in BF16)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
-    # and non-bank grads are manually all-reduced before Adam steps.
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # No DDP -- Parallel Muon handles matrix-param grad communication via reduce-scatter,
+    # scalar and embedding params manually all-reduced before Adam steps.
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model = compiled_model
 
     # Optimizer split:
     # - 4 parameter banks -> Muon (batched Newton-Schulz)
     # - token embedding -> Adam
     # - scalars/control tensors -> Adam
-    # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
+    # HELIX optimizer routing:
+    # 2D weight matrices from blocks (DTPA projections + SwiGLU weights) -> Parallel Muon
+    # Excludes: control-pattern tensors, 3D basis tensors (A_q/A_k/A_v)
+    all_block_named = list(base_model.blocks.named_parameters())
     matrix_params = [
-        base_model.qo_bank, base_model.kv_bank,
-        base_model.mlp_up_bank, base_model.mlp_down_bank,
+        p for n, p in all_block_named
+        if p.ndim == 2
+        and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        and not any(x in n for x in ('A_q', 'A_k', 'A_v'))
     ]
-    block_named_params = list(base_model.blocks.named_parameters())
+    # Scalar/control params from blocks -> scalar AdamW
     scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        p for n, p in all_block_named
+        if p.ndim != 2
+        or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        or any(x in n for x in ('A_q', 'A_k', 'A_v'))
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # MoR gate params -> scalar AdamW
+    for p in base_model.mor_gate.parameters():
+        scalar_params.append(p)
+    # Model-level scalars
     scalar_params.append(base_model.smear.gate)
-    if base_model.bigram is not None:
-        scalar_params.append(base_model.bigram.scale)
+    scalar_params.append(base_model.bigram.scale)
+    if base_model.bigram.proj is not None:
+        scalar_params.append(base_model.bigram.proj.weight)
+    scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
-    if base_model.bigram is not None:
-        tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.bigram.proj is not None:
-            scalar_params.append(base_model.bigram.proj.weight)
-    if base_model.ve_shared is not None:
-        tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
-        if base_model.ve_shared.proj is not None:
-            scalar_params.append(base_model.ve_shared.proj.weight)
-        scalar_params.append(base_model.ve_shared.scale)
-        for s in base_model.ve_layer_scales:
-            scalar_params.append(s)
+    tok_params = [
+        {"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr},
+        {"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr},
+    ]
     optimizer_tok = torch.optim.AdamW(
         tok_params,
         betas=(args.beta1, args.beta2),
@@ -1535,9 +1525,9 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    # Non-bank params that need manual all-reduce (replicated across GPUs)
-    replicated_params = list(optimizer_tok.param_groups[0]["params"])
-    for pg in optimizer_tok.param_groups[1:]:
+    # Non-matrix params that need manual all-reduce (replicated across GPUs)
+    replicated_params = []
+    for pg in tok_params:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
 
@@ -1557,7 +1547,7 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.dtpa.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
@@ -1661,6 +1651,13 @@ def main() -> None:
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
+        # MoR load-balancing weight: starts at mor_lb_weight, decays to 0 during warmdown
+        if args.warmdown_iters > 0 and scale < 1.0:
+            warmdown_frac = 1.0 - scale
+            decay_frac = min(1.0, warmdown_frac * args.warmdown_iters / max(args.mor_lb_decay_steps, 1))
+            base_model._current_lb_weight = args.mor_lb_weight * (1.0 - decay_frac)
+        else:
+            base_model._current_lb_weight = args.mor_lb_weight
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
