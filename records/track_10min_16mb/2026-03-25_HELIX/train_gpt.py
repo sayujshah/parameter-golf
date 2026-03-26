@@ -1219,9 +1219,15 @@ def eval_val_sliding_ttt(
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if ".mlp." in name:
+    # HELIX SwiGLU FFN + SOTA MLP
+    if ".swiglu." in name or ".mlp." in name:
         return "mlp"
-    if ".attn." in name or (".proj." in name and ".mlp." not in name):
+    # HELIX D-TPA + SOTA attention (W_O is >65536 numel → int6)
+    if ".dtpa." in name or ".attn." in name or (
+        ".proj." in name
+        and ".mlp." not in name
+        and ".swiglu." not in name
+    ):
         return "attn"
     return "other"
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
@@ -1767,10 +1773,9 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-    # Unbank 3D tensors into individual 2D tensors for quantization
+    # HELIX has no 3D bank tensors — quantize the state dict directly
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1790,25 +1795,25 @@ def main() -> None:
         io.BytesIO(lzma.decompress(quant_blob_disk)),
         map_location="cpu",
     )
-    deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
-    # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
-    eval_model = GPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        mtp_num_heads=0, mtp_loss_weight=0.0,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    eval_model = HELIX_GPT(
+        vocab_size=args.vocab_size,
+        num_unique_blocks=args.num_unique_blocks,
+        num_iterations=args.num_iterations,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads,
+        dtpa_rank=args.dtpa_rank,
+        ffn_hidden=args.ffn_hidden,
+        rope_dims=args.rope_dims,
         xsa_last_n=args.xsa_last_n,
-        rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        gated_attention=args.gated_attention, value_residual=args.value_residual,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+        tie_embeddings=args.tie_embeddings,
+        tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap,
+        rope_base=args.rope_base,
     ).to(device).bfloat16()
-    eval_model.qo_bank.data = eval_model.qo_bank.data.float()
-    eval_model.kv_bank.data = eval_model.kv_bank.data.float()
-    eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
-    eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
