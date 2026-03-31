@@ -17,6 +17,11 @@ try:
     _COMPRESSOR = "zstd"
 except ImportError:
     _COMPRESSOR = "zlib"
+try:
+    from tqdm import tqdm as _tqdm
+    _HAVE_TQDM = True
+except ImportError:
+    _HAVE_TQDM = False
 import numpy as np
 import sentencepiece as spm
 import torch
@@ -677,17 +682,18 @@ class DTPA(nn.Module):
 
         # ---- Step 1: Factored Q/K/V reconstruction ----
         # W_cQ projects h to context codes, then einsum with static basis A_q
+        dtype = h.dtype
         c_Q = self.W_cQ(h).view(B, T, 2 * self.n_heads, self.rank)   # [B, T, 16, 4]
         # Broadcast einsum: code[b,t,head,r] × basis[head,r,d] → sum over r
-        Q_all = (c_Q.unsqueeze(-1) * self.A_q).sum(-2)                # [B, T, 16, 48]
+        Q_all = (c_Q.unsqueeze(-1) * self.A_q.to(dtype=dtype)).sum(-2)  # [B, T, 16, 48]
         Q1, Q2 = Q_all.chunk(2, dim=2)                                # each [B, T, 8, 48]
 
         c_K = self.W_cK(h).view(B, T, 2 * self.n_kv, self.rank)      # [B, T, 8, 4]
-        K_all = (c_K.unsqueeze(-1) * self.A_k).sum(-2)                # [B, T, 8, 48]
+        K_all = (c_K.unsqueeze(-1) * self.A_k.to(dtype=dtype)).sum(-2)  # [B, T, 8, 48]
         K1, K2 = K_all.chunk(2, dim=2)                                # each [B, T, 4, 48]
 
         c_V = self.W_cV(h).view(B, T, 2 * self.n_kv, self.rank)
-        V_all = (c_V.unsqueeze(-1) * self.A_v).sum(-2)                # [B, T, 8, 48]
+        V_all = (c_V.unsqueeze(-1) * self.A_v.to(dtype=dtype)).sum(-2)  # [B, T, 8, 48]
         V1, V2 = V_all.chunk(2, dim=2)                                # each [B, T, 4, 48]
 
         # ---- Step 2: Partial RoPE on reconstructed Q/K ----
@@ -711,7 +717,7 @@ class DTPA(nn.Module):
         if self.use_xsa and layer_r == self.num_iterations - 1:
             # XSA: use first d_head_half dims of residual stream as V values
             # x_residual [B, T, 768] → [B, T, 8, 48] by splitting the first 384 dims
-            x_as_v = x_residual[..., :self.n_heads * self.d_head_half]
+            x_as_v = x_residual[..., :self.n_heads * self.d_head_half].to(dtype=dtype)
             x_as_v = x_as_v.view(B, T, self.n_heads, self.d_head_half)
             # Expand K1 [B, T, 4, 48] → [B, T, 8, 48] for full-head attention
             K1_exp = K1.repeat_interleave(self.n_heads // self.n_kv, dim=2)
@@ -1621,6 +1627,17 @@ def main() -> None:
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
+    _pbar_total = int(args.max_wallclock_seconds) if args.max_wallclock_seconds > 0 else args.iterations
+    _pbar_unit  = "s" if args.max_wallclock_seconds > 0 else "step"
+    _pbar = _tqdm(
+        total=_pbar_total,
+        unit=_pbar_unit,
+        desc="Training",
+        dynamic_ncols=True,
+        disable=(not _HAVE_TQDM) or rank != 0,
+        bar_format="{l_bar}{bar}| {n:.0f}/{total:.0f}{unit} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    ) if _HAVE_TQDM else None
+    _pbar_last_s = 0.0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
@@ -1703,6 +1720,21 @@ def main() -> None:
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if _pbar is not None:
+            _elapsed_s = approx_training_time_ms / 1000.0
+            if args.max_wallclock_seconds > 0:
+                _delta = _elapsed_s - _pbar_last_s
+                if _delta >= 1.0:
+                    _pbar.update(_delta)
+                    _pbar_last_s = _elapsed_s
+            else:
+                _pbar.update(1)
+            _pbar.set_postfix(
+                step=f"{step}/{args.iterations}",
+                loss=f"{train_loss.item():.4f}",
+                lr_scale=f"{scale:.3f}",
+                refresh=False,
+            )
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
@@ -1730,6 +1762,8 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+    if _pbar is not None:
+        _pbar.close()
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
