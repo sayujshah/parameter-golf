@@ -721,12 +721,20 @@ class DTPA(nn.Module):
             x_as_v = x_as_v.view(B, T, self.n_heads, self.d_head_half)
             # Expand K1 [B, T, 4, 48] → [B, T, 8, 48] for full-head attention
             K1_exp = K1.repeat_interleave(self.n_heads // self.n_kv, dim=2)
+            # FA3 requires bf16/fp16
+            Q1 = Q1.to(torch.bfloat16)
+            K1_exp = K1_exp.to(torch.bfloat16)
+            x_as_v = x_as_v.to(torch.bfloat16)
             # flash_attn_3_func takes [B, T, H, D] format
             out = flash_attn_3_func(Q1, K1_exp, x_as_v, causal=True)  # [B, T, 8, 48]
             out = out.reshape(B, T, self.n_heads * self.d_head_half)   # [B, T, 384]
             return self.W_O_xsa(out)                                   # [B, T, 768]
 
         # ---- Step 5: Differential attention ----
+        # FA3 requires bf16/fp16; explicitly cast in case inductor promotes to fp32
+        Q1, Q2 = Q1.to(torch.bfloat16), Q2.to(torch.bfloat16)
+        K1, K2 = K1.to(torch.bfloat16), K2.to(torch.bfloat16)
+        V1, V2 = V1.to(torch.bfloat16), V2.to(torch.bfloat16)
         # FA3 handles GQA natively (Q:8 heads, K/V:4 heads → output:8 heads)
         out1 = flash_attn_3_func(Q1, K1, V1, causal=True)             # [B, T, 8, 48]
         out2 = flash_attn_3_func(Q2, K2, V2, causal=True)             # [B, T, 8, 48]
