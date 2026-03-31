@@ -940,11 +940,11 @@ class HELIX_GPT(nn.Module):
     def _mor_aux_loss(self, gate_logits):
         if not gate_logits:
             return torch.tensor(0.0)
-        p0 = torch.sigmoid(gate_logits[0]).mean()
-        p1 = torch.sigmoid(gate_logits[1]).mean()
-        target = 1.0 / 3.0
+        n = len(gate_logits)
+        target = 1.0 / (n + 1)
         w = self._current_lb_weight
-        return w * ((p0 - target) ** 2 + (p1 - target) ** 2)
+        loss = sum((torch.sigmoid(g).mean() - target) ** 2 for g in gate_logits)
+        return w * loss
     def forward(self, input_ids, target_ids):
         x = self._embed(input_ids)
         x0 = x.clone()
