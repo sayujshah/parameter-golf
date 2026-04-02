@@ -37,6 +37,8 @@ except ImportError:
     except ImportError:
         def flash_attn_3_func(q, k, v, causal=False):
             # Pure PyTorch SDPA fallback — works on any GPU/CPU
+            # Explicitly forces math backend so global flash=True/math=False
+            # settings (set in main()) don't cause "Invalid backend" errors.
             # q: [B,T,Hq,D]  k,v: [B,T,Hkv,D]
             B, T, Hq, D = q.shape
             Hkv = k.shape[2]
@@ -47,7 +49,10 @@ except ImportError:
             q = q.transpose(1, 2)  # [B,Hq,T,D]
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_math=True, enable_mem_efficient=True
+            ):
+                out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
             return out.transpose(1, 2)  # [B,T,Hq,D]
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
